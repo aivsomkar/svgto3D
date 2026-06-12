@@ -2,8 +2,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { Font } from 'three/addons/loaders/FontLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { STLExporter } from 'three/addons/exporters/STLExporter.js';
 import { GIFEncoder, quantize, applyPalette } from 'gifenc';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import helvetiker from 'three/examples/fonts/helvetiker_bold.typeface.json';
 import { SUBJECTS } from './subjects.js';
 
 const LOOP_SECONDS = 4;
@@ -24,9 +28,17 @@ const MOTIONS = {
   light: ['light pan', 'glint', 'flicker'],
 };
 
+const ENVS = ['studio', 'sunset', 'neon', 'noir'];
+
+const ALL_MOTIONS = Object.values(MOTIONS).flat();
+const ALL_MATERIALS = [...Object.keys(MATERIALS), 'original', 'custom'];
+
 const state = {
+  mode: 'svg', // 'svg' | 'text'
   subject: 'star',
+  text: '',
   material: 'chrome',
+  env: 'studio',
   depth: 0.05,
   bevel: 0.05,
   motion: 'turntable',
@@ -36,6 +48,63 @@ const state = {
   svgName: 'star',
   custom: { color: '#ff4d00', metalness: 1, roughness: 0.2, transmission: 0, clearcoat: 0 },
 };
+
+// ----- url state -----
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function parseURL() {
+  const p = new URLSearchParams(location.search);
+  const num = (key, lo, hi, fallback) => {
+    const v = parseFloat(p.get(key));
+    return Number.isFinite(v) ? clamp(v, lo, hi) : fallback;
+  };
+  if (p.get('t')) {
+    state.mode = 'text';
+    state.text = p.get('t').slice(0, 24);
+    state.subject = null;
+    state.svgName = state.text.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'text';
+  } else if (SUBJECTS[p.get('s')]) {
+    state.subject = p.get('s');
+    state.svgName = state.subject;
+    state.svgText = SUBJECTS[state.subject];
+  }
+  if (ALL_MATERIALS.includes(p.get('m'))) state.material = p.get('m');
+  if (ALL_MOTIONS.includes(p.get('mo'))) state.motion = p.get('mo');
+  if (ENVS.includes(p.get('e'))) state.env = p.get('e');
+  state.depth = num('d', 0.01, 0.5, state.depth);
+  state.bevel = num('b', 0, 0.1, state.bevel);
+  state.frames = Math.round(num('f', 8, 96, state.frames));
+  state.size = Math.round(num('z', 32, 256, state.size));
+  if (/^[0-9a-f]{6}$/i.test(p.get('co') || '')) state.custom.color = '#' + p.get('co');
+  state.custom.metalness = num('cm', 0, 1, state.custom.metalness);
+  state.custom.roughness = num('cr', 0, 1, state.custom.roughness);
+  state.custom.transmission = num('cg', 0, 1, state.custom.transmission);
+  state.custom.clearcoat = num('ck', 0, 1, state.custom.clearcoat);
+}
+
+function updateURL() {
+  const p = new URLSearchParams();
+  if (state.mode === 'text' && state.text) p.set('t', state.text);
+  else if (state.subject) p.set('s', state.subject);
+  p.set('m', state.material);
+  p.set('mo', state.motion);
+  p.set('e', state.env);
+  p.set('d', state.depth);
+  p.set('b', state.bevel);
+  p.set('f', state.frames);
+  p.set('z', state.size);
+  if (state.material === 'custom') {
+    p.set('co', state.custom.color.slice(1));
+    p.set('cm', state.custom.metalness);
+    p.set('cr', state.custom.roughness);
+    p.set('cg', state.custom.transmission);
+    p.set('ck', state.custom.clearcoat);
+  }
+  history.replaceState(null, '', '?' + p.toString());
+}
+
+parseURL();
 
 // ----- scene -----
 
@@ -61,7 +130,6 @@ controls.enableDamping = true;
 controls.enablePan = false;
 
 const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
 const key = new THREE.DirectionalLight(0xffffff, 1.2);
 key.position.set(2, 3, 4);
@@ -70,8 +138,58 @@ scene.add(key);
 const root = new THREE.Group();
 scene.add(root);
 
-let mesh = null;
-let material = makeMaterial(state.material);
+const font = new Font(helvetiker);
+
+let modelGroup = null;
+let subColors = [];
+let activeMaterials = [];
+
+// ----- environments -----
+
+const envCache = {};
+
+function lightPlane(target, color, intensity, w, h, pos) {
+  const mat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(color).multiplyScalar(intensity),
+    side: THREE.DoubleSide,
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  m.position.set(...pos);
+  m.lookAt(0, 0, 0);
+  target.add(m);
+}
+
+function buildEnvScene(name) {
+  const s = new THREE.Scene();
+  if (name === 'sunset') {
+    lightPlane(s, '#ff6a00', 6, 8, 3, [0, -0.5, -6]); // low sun
+    lightPlane(s, '#ff9d5c', 2, 10, 10, [0, -4, 0]); // warm bounce
+    lightPlane(s, '#4a3b8f', 1.4, 10, 6, [0, 5, 2]); // violet sky
+    lightPlane(s, '#ffd9b0', 3, 3, 6, [6, 0, 1]); // warm rim
+  } else if (name === 'neon') {
+    lightPlane(s, '#ff00aa', 8, 1.2, 8, [-4, 0, 1]);
+    lightPlane(s, '#00e5ff', 8, 1.2, 8, [4, 0, 1]);
+    lightPlane(s, '#ffffff', 1, 6, 1, [0, 5, 0]);
+    lightPlane(s, '#3300ff', 2, 8, 8, [0, 0, -6]);
+  } else if (name === 'noir') {
+    lightPlane(s, '#ffffff', 7, 2, 7, [-5, 1, 2]);
+    lightPlane(s, '#888888', 0.8, 6, 6, [5, 0, -2]);
+  }
+  return s;
+}
+
+function setEnv(name) {
+  state.env = name;
+  if (!envCache[name]) {
+    const src = name === 'studio' ? new RoomEnvironment() : buildEnvScene(name);
+    envCache[name] = pmrem.fromScene(src, 0.04).texture;
+  }
+  scene.environment = envCache[name];
+  refreshActive('#envs .btn', name);
+  scheduleFilm();
+}
+
+// ----- materials -----
 
 function makeMaterial(name) {
   const def =
@@ -91,21 +209,65 @@ function makeMaterial(name) {
   return mat;
 }
 
+function assignMaterial(name) {
+  if (!modelGroup) return;
+  for (const m of activeMaterials) m.dispose();
+  if (name === 'original') {
+    activeMaterials = modelGroup.children.map((child, i) => {
+      const m = new THREE.MeshPhysicalMaterial({
+        color: subColors[i],
+        metalness: 0.2,
+        roughness: 0.35,
+        clearcoat: 0.6,
+        clearcoatRoughness: 0.25,
+      });
+      m.envMapIntensity = 1;
+      child.material = m;
+      return m;
+    });
+  } else {
+    const m = makeMaterial(name);
+    for (const child of modelGroup.children) child.material = m;
+    activeMaterials = [m];
+  }
+}
+
 // ----- model building -----
 
 function buildModel() {
-  const data = new SVGLoader().parse(state.svgText);
-  const shapes = [];
-  for (const path of data.paths) shapes.push(...SVGLoader.createShapes(path));
-  if (!shapes.length) return;
+  let items = [];
+  let flipY = true;
 
-  const flat = new THREE.ShapeGeometry(shapes);
+  if (state.mode === 'text' && state.text.trim()) {
+    const shapes = font.generateShapes(state.text.trim(), 100);
+    items = [{ shapes, color: new THREE.Color(0x111111) }];
+    flipY = false;
+  } else {
+    const data = new SVGLoader().parse(state.svgText);
+    for (const path of data.paths) {
+      const style = path.userData?.style ?? {};
+      if (style.fill === 'none') continue;
+      const shapes = SVGLoader.createShapes(path);
+      if (!shapes.length) continue;
+      const color = new THREE.Color(0x111111);
+      try {
+        if (style.fill) color.setStyle(style.fill);
+        else if (path.color) color.copy(path.color);
+      } catch {
+        /* keep fallback color */
+      }
+      items.push({ shapes, color });
+    }
+  }
+  if (!items.length) return;
+
+  const flat = new THREE.ShapeGeometry(items.flatMap((i) => i.shapes));
   flat.computeBoundingBox();
-  const bb = flat.boundingBox;
+  const fb = flat.boundingBox;
   flat.dispose();
-  const size = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y) || 1;
+  const size = Math.max(fb.max.x - fb.min.x, fb.max.y - fb.min.y) || 1;
 
-  const geo = new THREE.ExtrudeGeometry(shapes, {
+  const opts = {
     steps: 1,
     depth: state.depth * size * 4,
     bevelEnabled: state.bevel > 0,
@@ -113,21 +275,31 @@ function buildModel() {
     bevelSize: state.bevel * size * 0.9,
     bevelSegments: 5,
     curveSegments: 32,
-  });
-  geo.computeBoundingBox();
-  const c = geo.boundingBox.getCenter(new THREE.Vector3());
-  geo.translate(-c.x, -c.y, -c.z);
-  const dims = geo.boundingBox.getSize(new THREE.Vector3());
+  };
+
+  const geos = items.map((item) => new THREE.ExtrudeGeometry(item.shapes, opts));
+  const box = new THREE.Box3();
+  for (const g of geos) {
+    g.computeBoundingBox();
+    box.union(g.boundingBox);
+  }
+  const c = box.getCenter(new THREE.Vector3());
+  for (const g of geos) g.translate(-c.x, -c.y, -c.z);
+  const dims = box.getSize(new THREE.Vector3());
   const scale = 1.7 / Math.max(dims.x, dims.y);
 
-  if (mesh) {
-    root.remove(mesh);
-    mesh.geometry.dispose();
+  if (modelGroup) {
+    root.remove(modelGroup);
+    for (const child of modelGroup.children) child.geometry.dispose();
   }
-  mesh = new THREE.Mesh(geo, material);
-  mesh.rotation.x = Math.PI; // svg y-axis points down
-  mesh.scale.setScalar(scale);
-  root.add(mesh);
+  modelGroup = new THREE.Group();
+  subColors = items.map((i) => i.color);
+  for (const g of geos) modelGroup.add(new THREE.Mesh(g));
+  modelGroup.rotation.x = flipY ? Math.PI : 0;
+  modelGroup.scale.setScalar(scale);
+  root.add(modelGroup);
+
+  assignMaterial(state.material);
   scheduleFilm();
 }
 
@@ -149,7 +321,7 @@ function applyMotion(t) {
   root.rotation.set(0, 0, 0);
   root.position.set(0, 0, 0);
   scene.environmentRotation.set(0, 0, 0);
-  material.envMapIntensity = 1;
+  for (const m of activeMaterials) m.envMapIntensity = 1;
 
   switch (state.motion) {
     case 'turntable':
@@ -184,11 +356,11 @@ function applyMotion(t) {
     case 'glint':
       root.rotation.y = 0.4;
       scene.environmentRotation.y = t * Math.PI;
-      material.envMapIntensity = 1 + 2.5 * gauss(t, 0.5, 0.12);
+      for (const m of activeMaterials) m.envMapIntensity = 1 + 2.5 * gauss(t, 0.5, 0.12);
       break;
     case 'flicker':
-      material.envMapIntensity =
-        0.55 + 0.45 * Math.abs(Math.sin(t * Math.PI * 13) * Math.sin(t * Math.PI * 29));
+      for (const m of activeMaterials)
+        m.envMapIntensity = 0.55 + 0.45 * Math.abs(Math.sin(t * Math.PI * 13) * Math.sin(t * Math.PI * 29));
       break;
   }
 }
@@ -201,6 +373,7 @@ let filmTimer = null;
 let lastBlob = null;
 
 function scheduleFilm() {
+  updateURL();
   clearTimeout(filmTimer);
   filmTimer = setTimeout(renderFilm, 600);
 }
@@ -220,8 +393,20 @@ function captureFrames(size, frames, onFrame) {
   resize();
 }
 
+function captureFrameCanvases(size, frames) {
+  const out = [];
+  captureFrames(size, frames, (canvas) => {
+    const copy = document.createElement('canvas');
+    copy.width = size;
+    copy.height = size;
+    copy.getContext('2d').drawImage(canvas, 0, 0);
+    out.push(copy);
+  });
+  return out;
+}
+
 function renderFilm() {
-  if (!mesh) return;
+  if (!modelGroup) return;
   const { frames, size } = state;
 
   const sprite = document.createElement('canvas');
@@ -306,14 +491,7 @@ async function exportMp4() {
   const fps = frames / LOOP_SECONDS;
   const loops = 3; // mp4 players rarely loop, so bake a few cycles in
 
-  const frameCanvases = [];
-  captureFrames(size, frames, (canvas) => {
-    const copy = document.createElement('canvas');
-    copy.width = size;
-    copy.height = size;
-    copy.getContext('2d').drawImage(canvas, 0, 0);
-    frameCanvases.push(copy);
-  });
+  const frameCanvases = captureFrameCanvases(size, frames);
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
@@ -358,6 +536,112 @@ async function exportMp4() {
   download(new Blob([muxer.target.buffer], { type: 'video/mp4' }), `${baseName()}.mp4`);
 }
 
+async function exportWebm() {
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) =>
+    typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)
+  );
+  if (!mime) {
+    infoEl.textContent = 'webm export not supported in this browser';
+    return;
+  }
+  const { frames, size } = state;
+  const fps = frames / LOOP_SECONDS;
+  const loops = 2;
+  const frameCanvases = captureFrameCanvases(size, frames);
+
+  // MediaRecorder keeps the canvas alpha channel, so the webm stays transparent
+  const cv = document.createElement('canvas');
+  cv.width = size;
+  cv.height = size;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(frameCanvases[0], 0, 0);
+
+  const stream = cv.captureStream(0);
+  const track = stream.getVideoTracks()[0];
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6_000_000 });
+  const chunks = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const stopped = new Promise((res) => (rec.onstop = res));
+  rec.start();
+
+  const total = frames * loops;
+  infoEl.textContent = `recording webm… (${Math.round((total / fps) * 10) / 10}s, realtime)`;
+  for (let i = 0; i < total; i++) {
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(frameCanvases[i % frames], 0, 0);
+    track.requestFrame();
+    await new Promise((r) => setTimeout(r, 1000 / fps));
+  }
+  rec.stop();
+  await stopped;
+  download(new Blob(chunks, { type: 'video/webm' }), `${baseName()}.webm`);
+}
+
+function atRest(fn) {
+  root.rotation.set(0, 0, 0);
+  root.position.set(0, 0, 0);
+  root.updateMatrixWorld(true);
+  fn();
+}
+
+function exportGlb() {
+  if (!modelGroup) return;
+  atRest(() => {
+    new GLTFExporter().parse(
+      modelGroup,
+      (buffer) => download(new Blob([buffer], { type: 'model/gltf-binary' }), `${state.svgName}.glb`),
+      (e) => {
+        console.error(e);
+        infoEl.textContent = 'glb export failed — see console';
+      },
+      { binary: true }
+    );
+  });
+}
+
+function exportStl() {
+  if (!modelGroup) return;
+  atRest(() => {
+    const data = new STLExporter().parse(modelGroup, { binary: true });
+    download(new Blob([data], { type: 'model/stl' }), `${state.svgName}.stl`);
+  });
+}
+
+function exportGrid() {
+  if (!modelGroup) return;
+  const cell = 256;
+  const cols = 3;
+  const rows = Math.ceil(ALL_MATERIALS.length / cols);
+  const sheet = document.createElement('canvas');
+  sheet.width = cols * cell;
+  sheet.height = rows * cell;
+  const sctx = sheet.getContext('2d');
+
+  const prevRatio = renderer.getPixelRatio();
+  renderer.setPixelRatio(1);
+  renderer.setSize(cell, cell, false);
+  camera.aspect = 1;
+  camera.updateProjectionMatrix();
+
+  ALL_MATERIALS.forEach((name, idx) => {
+    assignMaterial(name);
+    root.rotation.set(-0.1, 0.65, 0);
+    root.position.set(0, 0, 0);
+    renderer.render(scene, camera);
+    const x = (idx % cols) * cell;
+    const y = Math.floor(idx / cols) * cell;
+    sctx.drawImage(renderer.domElement, x, y);
+    sctx.fillStyle = '#000';
+    sctx.font = '14px "IBM Plex Mono", monospace';
+    sctx.fillText(name, x + 10, y + cell - 12);
+  });
+
+  assignMaterial(state.material);
+  renderer.setPixelRatio(prevRatio);
+  resize();
+  sheet.toBlob((blob) => download(blob, `${state.svgName}-materials.png`), 'image/png');
+}
+
 function bindExport(id, fn) {
   const btn = document.getElementById(id);
   btn.addEventListener('click', async () => {
@@ -376,6 +660,10 @@ bindExport('export-sprite', () => {
 });
 bindExport('export-gif', exportGif);
 bindExport('export-mp4', exportMp4);
+bindExport('export-webm', exportWebm);
+bindExport('export-glb', exportGlb);
+bindExport('export-stl', exportStl);
+bindExport('export-grid', exportGrid);
 
 // ----- ui -----
 
@@ -418,15 +706,27 @@ buttonGroup(
   true
 );
 
-const customBtn = document.createElement('button');
-customBtn.className = 'btn';
-customBtn.dataset.name = 'custom';
-const customSwatch = document.createElement('span');
-customSwatch.className = 'swatch';
-customSwatch.style.background = state.custom.color;
-customBtn.append(customSwatch, document.createTextNode('custom'));
-customBtn.addEventListener('click', () => setMaterial('custom'));
-document.getElementById('materials').appendChild(customBtn);
+function extraMaterialButton(name, swatchStyle) {
+  const btn = document.createElement('button');
+  btn.className = 'btn';
+  btn.dataset.name = name;
+  const dot = document.createElement('span');
+  dot.className = 'swatch';
+  dot.style.background = swatchStyle;
+  btn.append(dot, document.createTextNode(name));
+  if (state.material === name) btn.classList.add('active');
+  btn.addEventListener('click', () => setMaterial(name));
+  document.getElementById('materials').appendChild(btn);
+  return dot;
+}
+
+extraMaterialButton(
+  'original',
+  'conic-gradient(#f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00)'
+);
+const customSwatch = extraMaterialButton('custom', state.custom.color);
+
+buttonGroup(document.getElementById('envs'), ENVS, (n) => n === state.env, (n) => setEnv(n));
 
 for (const [group, names] of Object.entries(MOTIONS)) {
   buttonGroup(
@@ -437,19 +737,22 @@ for (const [group, names] of Object.entries(MOTIONS)) {
   );
 }
 
+const textInput = document.getElementById('textinput');
+
 function setSubject(name) {
+  state.mode = 'svg';
   state.subject = name;
   state.svgName = name;
   state.svgText = SUBJECTS[name];
+  state.text = '';
+  textInput.value = '';
   refreshActive('#subjects .btn', name);
   buildModel();
 }
 
 function setMaterial(name) {
   state.material = name;
-  material.dispose();
-  material = makeMaterial(name);
-  if (mesh) mesh.material = material;
+  assignMaterial(name);
   refreshActive('#materials .btn', name);
   document.getElementById('custom-controls').hidden = name !== 'custom';
   scheduleFilm();
@@ -461,11 +764,12 @@ function updateCustom(prop, value) {
     setMaterial('custom');
     return;
   }
+  const mat = activeMaterials[0];
   if (prop === 'color') {
-    material.color.set(value);
+    mat.color.set(value);
   } else {
-    material[prop] = value;
-    if (prop === 'transmission') material.thickness = value > 0 ? 1.2 : 0;
+    mat[prop] = value;
+    if (prop === 'transmission') mat.thickness = value > 0 ? 1.2 : 0;
   }
   scheduleFilm();
 }
@@ -489,41 +793,80 @@ function bindSlider(id, format, onChange) {
     out.textContent = format(v);
     onChange(v);
   });
-  return input;
+  return { input, out, format };
 }
 
-const depthInput = bindSlider('depth', (v) => v.toFixed(2), (v) => {
-  state.depth = v;
-  buildModel();
-});
-const bevelInput = bindSlider('bevel', (v) => v.toFixed(3), (v) => {
-  state.bevel = v;
-  buildModel();
-});
-const framesInput = bindSlider('frames', (v) => `${v}`, (v) => {
-  state.frames = v;
-  scheduleFilm();
-});
-bindSlider('size', (v) => `${v}px`, (v) => {
-  state.size = v;
-  scheduleFilm();
-});
-bindSlider('cmetal', (v) => v.toFixed(2), (v) => updateCustom('metalness', v));
-bindSlider('crough', (v) => v.toFixed(2), (v) => updateCustom('roughness', v));
-bindSlider('ctrans', (v) => v.toFixed(2), (v) => updateCustom('transmission', v));
-bindSlider('ccoat', (v) => v.toFixed(2), (v) => updateCustom('clearcoat', v));
+const sliders = {
+  depth: bindSlider('depth', (v) => v.toFixed(2), (v) => {
+    state.depth = v;
+    buildModel();
+  }),
+  bevel: bindSlider('bevel', (v) => v.toFixed(3), (v) => {
+    state.bevel = v;
+    buildModel();
+  }),
+  frames: bindSlider('frames', (v) => `${v}`, (v) => {
+    state.frames = v;
+    scheduleFilm();
+  }),
+  size: bindSlider('size', (v) => `${v}px`, (v) => {
+    state.size = v;
+    scheduleFilm();
+  }),
+  cmetal: bindSlider('cmetal', (v) => v.toFixed(2), (v) => updateCustom('metalness', v)),
+  crough: bindSlider('crough', (v) => v.toFixed(2), (v) => updateCustom('roughness', v)),
+  ctrans: bindSlider('ctrans', (v) => v.toFixed(2), (v) => updateCustom('transmission', v)),
+  ccoat: bindSlider('ccoat', (v) => v.toFixed(2), (v) => updateCustom('clearcoat', v)),
+};
+
+function setSliderValue(name, value) {
+  const s = sliders[name];
+  s.input.value = value;
+  s.out.textContent = s.format(value);
+}
+
+function syncControls() {
+  setSliderValue('depth', state.depth);
+  setSliderValue('bevel', state.bevel);
+  setSliderValue('frames', state.frames);
+  setSliderValue('size', state.size);
+  setSliderValue('cmetal', state.custom.metalness);
+  setSliderValue('crough', state.custom.roughness);
+  setSliderValue('ctrans', state.custom.transmission);
+  setSliderValue('ccoat', state.custom.clearcoat);
+  document.getElementById('ccolor').value = state.custom.color;
+  customSwatch.style.background = state.custom.color;
+  document.getElementById('custom-controls').hidden = state.material !== 'custom';
+  if (state.mode === 'text') textInput.value = state.text;
+}
 
 document.getElementById('random').addEventListener('click', () => {
   const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
   setMaterial(pick(Object.keys(MATERIALS)));
-  setMotion(pick(Object.values(MOTIONS).flat()));
+  setMotion(pick(ALL_MOTIONS));
+  setEnv(pick(ENVS));
   state.depth = +(0.02 + Math.random() * 0.3).toFixed(3);
   state.bevel = +(Math.random() * 0.08).toFixed(3);
-  depthInput.value = state.depth;
-  bevelInput.value = state.bevel;
-  document.getElementById('depth-val').textContent = state.depth.toFixed(2);
-  document.getElementById('bevel-val').textContent = state.bevel.toFixed(3);
+  setSliderValue('depth', state.depth);
+  setSliderValue('bevel', state.bevel);
   setSubject(pick(Object.keys(SUBJECTS)));
+});
+
+// ----- text → 3d -----
+
+let textTimer = null;
+textInput.addEventListener('input', () => {
+  clearTimeout(textTimer);
+  textTimer = setTimeout(() => {
+    const v = textInput.value.trim();
+    if (!v) return;
+    state.mode = 'text';
+    state.text = v;
+    state.subject = null;
+    state.svgName = v.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24) || 'text';
+    refreshActive('#subjects .btn', null);
+    buildModel();
+  }, 350);
 });
 
 // ----- upload / drag-drop -----
@@ -531,9 +874,12 @@ document.getElementById('random').addEventListener('click', () => {
 function loadSvgFile(file) {
   if (!file || !/\.svg$/i.test(file.name)) return;
   file.text().then((text) => {
+    state.mode = 'svg';
     state.svgText = text;
     state.svgName = file.name.replace(/\.svg$/i, '');
     state.subject = null;
+    state.text = '';
+    textInput.value = '';
     refreshActive('#subjects .btn', null);
     buildModel();
   });
@@ -560,6 +906,15 @@ window.addEventListener('drop', (e) => {
   loadSvgFile(e.dataTransfer.files[0]);
 });
 
+// ----- camera -----
+
+document.getElementById('resetcam').addEventListener('click', () => {
+  camera.position.set(0, 0, 3.2);
+  controls.target.set(0, 0, 0);
+  controls.update();
+  scheduleFilm();
+});
+
 // ----- render loop -----
 
 function resize() {
@@ -579,4 +934,6 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 
+setEnv(state.env);
+syncControls();
 buildModel();
