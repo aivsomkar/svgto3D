@@ -206,6 +206,7 @@ function makeMaterial(name) {
       : MATERIALS[name];
   const mat = new THREE.MeshPhysicalMaterial(def);
   mat.envMapIntensity = 1;
+  mat.side = THREE.DoubleSide;
   return mat;
 }
 
@@ -222,6 +223,7 @@ function assignMaterial(name) {
         clearcoatRoughness: 0.25,
       });
       m.envMapIntensity = 1;
+      m.side = THREE.DoubleSide;
       child.material = m;
       return m;
     });
@@ -234,38 +236,141 @@ function assignMaterial(name) {
 
 // ----- model building -----
 
+function parseColor(str, fallback) {
+  const c = new THREE.Color(0x111111);
+  try {
+    if (str && !str.startsWith('url(')) c.setStyle(str);
+    else if (fallback) c.copy(fallback);
+  } catch {
+    /* keep fallback color */
+  }
+  return c;
+}
+
+// Extrude a flat triangulated geometry (e.g. SVGLoader.pointsToStroke output)
+// into a solid: front + back faces plus walls along boundary edges.
+function extrudeFlat(srcGeo, depth) {
+  const posAttr = srcGeo.getAttribute('position');
+  const idxAttr = srcGeo.getIndex();
+  const keyOf = (x, y) => `${Math.round(x * 1e4)}|${Math.round(y * 1e4)}`;
+  const seen = new Map();
+  const verts = [];
+  const remap = new Array(posAttr.count);
+  for (let i = 0; i < posAttr.count; i++) {
+    const x = posAttr.getX(i);
+    const y = posAttr.getY(i);
+    const k = keyOf(x, y);
+    if (!seen.has(k)) {
+      seen.set(k, verts.length);
+      verts.push([x, y]);
+    }
+    remap[i] = seen.get(k);
+  }
+  const tris = [];
+  const triCount = (idxAttr ? idxAttr.count : posAttr.count) / 3;
+  const at = (n) => remap[idxAttr ? idxAttr.getX(n) : n];
+  for (let t = 0; t < triCount; t++) {
+    const a = at(t * 3);
+    const b = at(t * 3 + 1);
+    const c = at(t * 3 + 2);
+    if (a !== b && b !== c && a !== c) tris.push([a, b, c]);
+  }
+  const edgeCount = new Map();
+  const ekey = (a, b) => (a < b ? `${a}_${b}` : `${b}_${a}`);
+  for (const [a, b, c] of tris)
+    for (const [u, v] of [[a, b], [b, c], [c, a]])
+      edgeCount.set(ekey(u, v), (edgeCount.get(ekey(u, v)) || 0) + 1);
+
+  const positions = [];
+  const push = (v, z) => positions.push(verts[v][0], verts[v][1], z);
+  for (const [a, b, c] of tris) {
+    push(a, depth); push(b, depth); push(c, depth);
+  }
+  for (const [a, b, c] of tris) {
+    push(c, 0); push(b, 0); push(a, 0);
+  }
+  for (const [a, b, c] of tris) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      if (edgeCount.get(ekey(u, v)) === 1) {
+        push(u, 0); push(v, 0); push(v, depth);
+        push(u, 0); push(v, depth); push(u, depth);
+      }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
 function buildModel() {
   let items = [];
   let flipY = true;
 
   if (state.mode === 'text' && state.text.trim()) {
     const shapes = font.generateShapes(state.text.trim(), 100);
-    items = [{ shapes, color: new THREE.Color(0x111111) }];
+    items = [{ kind: 'fill', shapes, color: new THREE.Color(0x111111) }];
     flipY = false;
   } else {
     const data = new SVGLoader().parse(state.svgText);
     for (const path of data.paths) {
       const style = path.userData?.style ?? {};
-      if (style.fill === 'none') continue;
-      const shapes = SVGLoader.createShapes(path);
-      if (!shapes.length) continue;
-      const color = new THREE.Color(0x111111);
-      try {
-        if (style.fill) color.setStyle(style.fill);
-        else if (path.color) color.copy(path.color);
-      } catch {
-        /* keep fallback color */
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (parseFloat(style.opacity) === 0) continue;
+      const hasFill = style.fill && style.fill !== 'none' && parseFloat(style.fillOpacity) !== 0;
+      const hasStroke =
+        style.stroke && style.stroke !== 'none' &&
+        (style.strokeWidth ?? 1) > 0 && parseFloat(style.strokeOpacity) !== 0;
+      if (hasFill) {
+        const shapes = SVGLoader.createShapes(path);
+        if (shapes.length) {
+          items.push({ kind: 'fill', shapes, color: parseColor(style.fill, path.color) });
+        }
       }
-      items.push({ shapes, color });
+      if (hasStroke) {
+        const color = parseColor(style.stroke, path.color);
+        for (const sub of path.subPaths) {
+          const geo = SVGLoader.pointsToStroke(sub.getPoints(), style);
+          if (geo) items.push({ kind: 'stroke', geo, color });
+        }
+      }
     }
   }
   if (!items.length) return;
 
-  const flat = new THREE.ShapeGeometry(items.flatMap((i) => i.shapes));
-  flat.computeBoundingBox();
-  const fb = flat.boundingBox;
-  flat.dispose();
-  const size = Math.max(fb.max.x - fb.min.x, fb.max.y - fb.min.y) || 1;
+  // SVG paint order: later paths draw on top. Coplanar extrusions would hide
+  // them, so a path that substantially covers a clearly larger earlier path
+  // (a background) gets raised a relief layer.
+  const boxes = items.map((item) => {
+    let b;
+    if (item.kind === 'fill') {
+      const g = new THREE.ShapeGeometry(item.shapes);
+      g.computeBoundingBox();
+      b = g.boundingBox.clone();
+      g.dispose();
+    } else {
+      item.geo.computeBoundingBox();
+      b = item.geo.boundingBox.clone();
+    }
+    return b;
+  });
+  const area = (b) => (b.max.x - b.min.x) * (b.max.y - b.min.y) || 1;
+  const coveredBy = (a, b) => {
+    const ix = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+    const iy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+    if (ix <= 0 || iy <= 0) return false;
+    return (ix * iy) / area(a) > 0.25 && area(b) > area(a) * 1.5;
+  };
+  const layers = items.map(() => 0);
+  for (let i = 1; i < items.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (coveredBy(boxes[i], boxes[j])) layers[i] = Math.max(layers[i], layers[j] + 1);
+    }
+  }
+
+  const bb2 = new THREE.Box3();
+  for (const b of boxes) bb2.union(b);
+  const size = Math.max(bb2.max.x - bb2.min.x, bb2.max.y - bb2.min.y) || 1;
 
   const opts = {
     steps: 1,
@@ -277,7 +382,19 @@ function buildModel() {
     curveSegments: 32,
   };
 
-  const geos = items.map((item) => new THREE.ExtrudeGeometry(item.shapes, opts));
+  const reliefUnit = size * Math.min(0.05, Math.max(0.01, state.depth));
+  const zSign = flipY ? -1 : 1;
+  const geos = items.map((item, i) => {
+    let g;
+    if (item.kind === 'fill') {
+      g = new THREE.ExtrudeGeometry(item.shapes, opts);
+    } else {
+      g = extrudeFlat(item.geo, opts.depth);
+      item.geo.dispose();
+    }
+    if (layers[i]) g.translate(0, 0, zSign * reliefUnit * layers[i]);
+    return g;
+  });
   const box = new THREE.Box3();
   for (const g of geos) {
     g.computeBoundingBox();
