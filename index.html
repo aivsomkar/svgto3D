@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>svg ⟶ 3d</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <span class="title">svg ⟶ 3d</span>
+      <span class="hint">drop an svg anywhere · drag to orbit</span>
+    </header>
+    <main>
+      <section id="stage">
+        <div id="viewport"></div>
+        <div id="filmwrap">
+          <div id="filmstrip"></div>
+          <div id="filminfo">rendering film…</div>
+        </div>
+      </section>
+      <aside id="panel">
+        <button id="random" class="btn">random</button>
+
+        <section>
+          <h2>subject</h2>
+          <div id="subjects" class="group"></div>
+          <button id="upload" class="btn dashed" type="button">upload svg</button>
+          <input id="file" type="file" accept=".svg,image/svg+xml" hidden />
+        </section>
+
+        <section>
+          <h2>material</h2>
+          <div id="materials" class="group"></div>
+          <div id="custom-controls" class="customwrap" hidden>
+            <div class="row"><h2>color</h2><input id="ccolor" type="color" value="#ff4d00" /></div>
+            <div class="slider">
+              <div class="row"><h2>metal</h2><span id="cmetal-val">1.00</span></div>
+              <input id="cmetal" type="range" min="0" max="1" step="0.01" value="1" />
+            </div>
+            <div class="slider">
+              <div class="row"><h2>rough</h2><span id="crough-val">0.20</span></div>
+              <input id="crough" type="range" min="0" max="1" step="0.01" value="0.2" />
+            </div>
+            <div class="slider">
+              <div class="row"><h2>glass</h2><span id="ctrans-val">0.00</span></div>
+              <input id="ctrans" type="range" min="0" max="1" step="0.01" value="0" />
+            </div>
+            <div class="slider">
+              <div class="row"><h2>coat</h2><span id="ccoat-val">0.00</span></div>
+              <input id="ccoat" type="range" min="0" max="1" step="0.01" value="0" />
+            </div>
+          </div>
+        </section>
+
+        <section class="slider">
+          <div class="row"><h2>depth</h2><span id="depth-val">0.05</span></div>
+          <input id="depth" type="range" min="0.01" max="0.5" step="0.005" value="0.05" />
+        </section>
+
+        <section class="slider">
+          <div class="row"><h2>bevel</h2><span id="bevel-val">0.050</span></div>
+          <input id="bevel" type="range" min="0" max="0.1" step="0.001" value="0.05" />
+        </section>
+
+        <section>
+          <h2>motion</h2>
+          <div class="motionrow"><span class="mlabel">spin</span><div class="group" id="motion-spin"></div></div>
+          <div class="motionrow"><span class="mlabel">object</span><div class="group" id="motion-object"></div></div>
+          <div class="motionrow"><span class="mlabel">light</span><div class="group" id="motion-light"></div></div>
+        </section>
+
+        <section>
+          <h2>film</h2>
+          <div class="slider">
+            <div class="row"><h2>frames</h2><span id="frames-val">48</span></div>
+            <input id="frames" type="range" min="8" max="96" step="4" value="48" />
+          </div>
+          <div class="slider">
+            <div class="row"><h2>size</h2><span id="size-val">96px</span></div>
+            <input id="size" type="range" min="32" max="256" step="32" value="96" />
+          </div>
+          <div class="exportrow">
+            <button id="export-sprite" class="btn solid">sprite</button>
+            <button id="export-gif" class="btn solid">gif</button>
+            <button id="export-mp4" class="btn solid">mp4</button>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

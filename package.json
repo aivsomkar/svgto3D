@@ -1,0 +1,19 @@
+{
+  "name": "svg-to-3d",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "gifenc": "^1.0.3",
+    "mp4-muxer": "^5.2.2",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "vite": "^7.3.0"
+  }
+}
