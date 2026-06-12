@@ -30,6 +30,8 @@ const MOTIONS = {
 
 const ENVS = ['studio', 'sunset', 'neon', 'noir'];
 
+const EXPORT_RES = { 512: 512, 1024: 1024, 2048: 2048, '4k': 3840 };
+
 const ALL_MOTIONS = Object.values(MOTIONS).flat();
 const ALL_MATERIALS = [...Object.keys(MATERIALS), 'original', 'custom'];
 
@@ -44,6 +46,7 @@ const state = {
   motion: 'turntable',
   frames: 48,
   size: 96,
+  exportRes: '1024',
   svgText: SUBJECTS.star,
   svgName: 'star',
   custom: { color: '#ff4d00', metalness: 1, roughness: 0.2, transmission: 0, clearcoat: 0 },
@@ -76,6 +79,7 @@ function parseURL() {
   state.bevel = num('b', 0, 0.1, state.bevel);
   state.frames = Math.round(num('f', 8, 96, state.frames));
   state.size = Math.round(num('z', 32, 256, state.size));
+  if (EXPORT_RES[p.get('x')]) state.exportRes = p.get('x');
   if (/^[0-9a-f]{6}$/i.test(p.get('co') || '')) state.custom.color = '#' + p.get('co');
   state.custom.metalness = num('cm', 0, 1, state.custom.metalness);
   state.custom.roughness = num('cr', 0, 1, state.custom.roughness);
@@ -94,6 +98,7 @@ function updateURL() {
   p.set('b', state.bevel);
   p.set('f', state.frames);
   p.set('z', state.size);
+  p.set('x', state.exportRes);
   if (state.material === 'custom') {
     p.set('co', state.custom.color.slice(1));
     p.set('cm', state.custom.metalness);
@@ -510,16 +515,57 @@ function captureFrames(size, frames, onFrame) {
   resize();
 }
 
-function captureFrameCanvases(size, frames) {
-  const out = [];
-  captureFrames(size, frames, (canvas) => {
-    const copy = document.createElement('canvas');
-    copy.width = size;
-    copy.height = size;
-    copy.getContext('2d').drawImage(canvas, 0, 0);
-    out.push(copy);
-  });
-  return out;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// High-res exports get their own renderer: frames render at up to 2x
+// supersampling and downscale to the target size. PMREM textures can't cross
+// WebGL contexts, so the environment is regenerated for the export context.
+// The main animation loop pauses so it can't fight over scene transforms.
+async function withExportRenderer(outSize, fn) {
+  const renderSize = Math.min(outSize * 2, 4096);
+  const xr = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+  xr.setPixelRatio(1);
+  xr.setSize(renderSize, renderSize, false);
+  xr.toneMapping = THREE.ACESFilmicToneMapping;
+  xr.setClearColor(0x000000, 0);
+
+  const xpmrem = new THREE.PMREMGenerator(xr);
+  const src = state.env === 'studio' ? new RoomEnvironment() : buildEnvScene(state.env);
+  const xenv = xpmrem.fromScene(src, 0.04).texture;
+  const prevEnv = scene.environment;
+  scene.environment = xenv;
+
+  const xcam = camera.clone();
+  xcam.aspect = 1;
+  xcam.updateProjectionMatrix();
+
+  const down = document.createElement('canvas');
+  down.width = outSize;
+  down.height = outSize;
+  const dctx = down.getContext('2d', { willReadFrequently: true });
+  dctx.imageSmoothingEnabled = true;
+  dctx.imageSmoothingQuality = 'high';
+
+  const renderFrame = (t, poseFn) => {
+    applyMotion(t);
+    if (poseFn) poseFn();
+    xr.render(scene, xcam);
+    dctx.clearRect(0, 0, outSize, outSize);
+    dctx.drawImage(xr.domElement, 0, 0, outSize, outSize);
+    return down;
+  };
+
+  renderer.setAnimationLoop(null);
+  try {
+    return await fn(renderFrame);
+  } finally {
+    scene.environment = prevEnv;
+    xenv.dispose();
+    xpmrem.dispose();
+    xr.dispose();
+    xr.forceContextLoss();
+    startMainLoop();
+  }
 }
 
 function renderFilm() {
@@ -563,40 +609,64 @@ function download(blob, filename) {
   infoEl.textContent = `saved ${filename} · ${kb}KB`;
 }
 
-function exportGif() {
-  const { frames, size } = state;
-  const gif = GIFEncoder();
+async function exportGif() {
+  const { frames } = state;
+  // gif palettes + players choke past 1k; quality comes from supersampling
+  const res = Math.min(EXPORT_RES[state.exportRes], 1024);
+  const capped = EXPORT_RES[state.exportRes] > res;
   const delay = (LOOP_SECONDS * 1000) / frames;
-  const tmp = document.createElement('canvas');
-  tmp.width = size;
-  tmp.height = size;
-  const tctx = tmp.getContext('2d', { willReadFrequently: true });
 
-  captureFrames(size, frames, (canvas) => {
-    tctx.clearRect(0, 0, size, size);
-    tctx.drawImage(canvas, 0, 0);
-    const { data } = tctx.getImageData(0, 0, size, size);
-    for (let i = 0; i < data.length; i += 4) {
-      if (data[i + 3] < 128) {
-        data[i] = data[i + 1] = data[i + 2] = data[i + 3] = 0;
-      } else {
-        data[i + 3] = 255;
+  await withExportRenderer(res, async (renderFrame) => {
+    const gif = GIFEncoder();
+    for (let i = 0; i < frames; i++) {
+      const canvas = renderFrame(i / frames);
+      const { data } = canvas.getContext('2d').getImageData(0, 0, res, res);
+      for (let j = 0; j < data.length; j += 4) {
+        if (data[j + 3] < 128) {
+          data[j] = data[j + 1] = data[j + 2] = data[j + 3] = 0;
+        } else {
+          data[j + 3] = 255;
+        }
       }
+      const palette = quantize(data, 256, { format: 'rgba4444' });
+      const index = applyPalette(data, palette, 'rgba4444');
+      const transparentIndex = palette.findIndex((p) => p[3] === 0);
+      gif.writeFrame(index, res, res, {
+        palette,
+        delay,
+        transparent: transparentIndex >= 0,
+        transparentIndex: Math.max(transparentIndex, 0),
+        dispose: 2,
+      });
+      infoEl.textContent = `encoding gif ${res}px… ${Math.round(((i + 1) / frames) * 100)}%${capped ? ' (gif caps at 1024px)' : ''}`;
+      await sleep(0);
     }
-    const palette = quantize(data, 256, { format: 'rgba4444' });
-    const index = applyPalette(data, palette, 'rgba4444');
-    const transparentIndex = palette.findIndex((p) => p[3] === 0);
-    gif.writeFrame(index, size, size, {
-      palette,
-      delay,
-      transparent: transparentIndex >= 0,
-      transparentIndex: Math.max(transparentIndex, 0),
-      dispose: 2,
-    });
+    gif.finish();
+    download(new Blob([gif.bytes()], { type: 'image/gif' }), `${baseName()}-${res}px.gif`);
   });
+}
 
-  gif.finish();
-  download(new Blob([gif.bytes()], { type: 'image/gif' }), `${baseName()}.gif`);
+async function pickVideoConfig(res, fps) {
+  const bitrate = Math.min(80_000_000, Math.round(res * res * fps * 0.12));
+  const candidates = [
+    { codec: 'avc1.640034', mux: 'avc' }, // h264 high 5.2
+    { codec: 'avc1.4d0028', mux: 'avc' },
+    { codec: 'avc1.42001f', mux: 'avc' },
+    { codec: 'hvc1.1.6.L186.B0', mux: 'hevc' }, // hevc level 6 for 4k square
+    { codec: 'hvc1.1.6.L153.B0', mux: 'hevc' },
+    { codec: 'av01.0.16M.08', mux: 'av1' },
+    { codec: 'av01.0.12M.08', mux: 'av1' },
+  ];
+  for (const { codec, mux } of candidates) {
+    const config = { codec, width: res, height: res, bitrate, framerate: fps };
+    try {
+      const { supported } = await VideoEncoder.isConfigSupported(config);
+      if (supported) return { config, mux };
+    } catch {
+      /* unknown codec string on this browser — try next */
+    }
+  }
+  return null;
 }
 
 async function exportMp4() {
@@ -604,94 +674,109 @@ async function exportMp4() {
     infoEl.textContent = 'mp4 export needs webcodecs (chrome / edge / recent safari)';
     return;
   }
-  const { frames, size } = state;
+  const { frames } = state;
+  let res = EXPORT_RES[state.exportRes];
   const fps = frames / LOOP_SECONDS;
   const loops = 3; // mp4 players rarely loop, so bake a few cycles in
 
-  const frameCanvases = captureFrameCanvases(size, frames);
-
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: { codec: 'avc', width: size, height: size },
-    fastStart: 'in-memory',
-  });
-  const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: (e) => {
-      console.error(e);
-      infoEl.textContent = 'mp4 encode failed — see console';
-    },
-  });
-  encoder.configure({
-    codec: 'avc1.42001f',
-    width: size,
-    height: size,
-    bitrate: 4_000_000,
-    framerate: fps,
-  });
-
-  // h264 has no alpha channel, so composite onto white
-  const tmp = document.createElement('canvas');
-  tmp.width = size;
-  tmp.height = size;
-  const tctx = tmp.getContext('2d');
-
-  const total = frames * loops;
-  for (let i = 0; i < total; i++) {
-    tctx.fillStyle = '#fff';
-    tctx.fillRect(0, 0, size, size);
-    tctx.drawImage(frameCanvases[i % frames], 0, 0);
-    const vf = new VideoFrame(tmp, {
-      timestamp: (i * 1e6) / fps,
-      duration: 1e6 / fps,
-    });
-    encoder.encode(vf, { keyFrame: i % frames === 0 });
-    vf.close();
+  let picked = await pickVideoConfig(res, fps);
+  if (!picked && res > 2160) {
+    res = 2160; // square 4k — within h264/hevc encoder limits
+    picked = await pickVideoConfig(res, fps);
   }
-  await encoder.flush();
-  muxer.finalize();
-  download(new Blob([muxer.target.buffer], { type: 'video/mp4' }), `${baseName()}.mp4`);
+  if (!picked) {
+    infoEl.textContent = `no video encoder supports ${res}px here — try a lower export res`;
+    return;
+  }
+
+  await withExportRenderer(res, async (renderFrame) => {
+    const muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      video: { codec: picked.mux, width: res, height: res },
+      fastStart: 'in-memory',
+    });
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => {
+        console.error(e);
+        infoEl.textContent = 'mp4 encode failed — see console';
+      },
+    });
+    encoder.configure(picked.config);
+
+    // h264 has no alpha channel, so composite onto white
+    const tmp = document.createElement('canvas');
+    tmp.width = res;
+    tmp.height = res;
+    const tctx = tmp.getContext('2d');
+
+    const total = frames * loops;
+    for (let i = 0; i < total; i++) {
+      const frame = renderFrame((i % frames) / frames);
+      tctx.fillStyle = '#fff';
+      tctx.fillRect(0, 0, res, res);
+      tctx.drawImage(frame, 0, 0);
+      const vf = new VideoFrame(tmp, {
+        timestamp: (i * 1e6) / fps,
+        duration: 1e6 / fps,
+      });
+      encoder.encode(vf, { keyFrame: i % frames === 0 });
+      vf.close();
+      while (encoder.encodeQueueSize > 4) await sleep(5);
+      if (i % 4 === 0) {
+        infoEl.textContent = `encoding mp4 ${res}px… ${Math.round((i / total) * 100)}%`;
+        await sleep(0);
+      }
+    }
+    await encoder.flush();
+    muxer.finalize();
+    download(new Blob([muxer.target.buffer], { type: 'video/mp4' }), `${baseName()}-${res}px.mp4`);
+  });
 }
 
 async function exportWebm() {
-  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) =>
-    typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(
+    (m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)
   );
   if (!mime) {
     infoEl.textContent = 'webm export not supported in this browser';
     return;
   }
-  const { frames, size } = state;
+  const { frames } = state;
+  const res = EXPORT_RES[state.exportRes];
   const fps = frames / LOOP_SECONDS;
   const loops = 2;
-  const frameCanvases = captureFrameCanvases(size, frames);
+  const bitrate = res >= 1920 ? 40_000_000 : res >= 1024 ? 16_000_000 : 8_000_000;
 
-  // MediaRecorder keeps the canvas alpha channel, so the webm stays transparent
-  const cv = document.createElement('canvas');
-  cv.width = size;
-  cv.height = size;
-  const ctx = cv.getContext('2d');
-  ctx.drawImage(frameCanvases[0], 0, 0);
+  await withExportRenderer(res, async (renderFrame) => {
+    // MediaRecorder keeps the canvas alpha channel, so the webm stays transparent
+    const cv = document.createElement('canvas');
+    cv.width = res;
+    cv.height = res;
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(renderFrame(0), 0, 0);
 
-  const stream = cv.captureStream(0);
-  const track = stream.getVideoTracks()[0];
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6_000_000 });
-  const chunks = [];
-  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  const stopped = new Promise((res) => (rec.onstop = res));
-  rec.start();
+    const stream = cv.captureStream(0);
+    const track = stream.getVideoTracks()[0];
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate });
+    const chunks = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    const stopped = new Promise((res2) => (rec.onstop = res2));
+    rec.start();
 
-  const total = frames * loops;
-  infoEl.textContent = `recording webm… (${Math.round((total / fps) * 10) / 10}s, realtime)`;
-  for (let i = 0; i < total; i++) {
-    ctx.clearRect(0, 0, size, size);
-    ctx.drawImage(frameCanvases[i % frames], 0, 0);
-    track.requestFrame();
-    await new Promise((r) => setTimeout(r, 1000 / fps));
-  }
-  rec.stop();
-  await stopped;
-  download(new Blob(chunks, { type: 'video/webm' }), `${baseName()}.webm`);
+    const total = frames * loops;
+    for (let i = 0; i < total; i++) {
+      const frame = renderFrame((i % frames) / frames);
+      ctx.clearRect(0, 0, res, res);
+      ctx.drawImage(frame, 0, 0);
+      track.requestFrame();
+      infoEl.textContent = `recording webm ${res}px… ${Math.round((i / total) * 100)}% (realtime)`;
+      await sleep(1000 / fps);
+    }
+    rec.stop();
+    await stopped;
+    download(new Blob(chunks, { type: 'video/webm' }), `${baseName()}-${res}px.webm`);
+  });
 }
 
 function atRest(fn) {
@@ -724,9 +809,9 @@ function exportStl() {
   });
 }
 
-function exportGrid() {
+async function exportGrid() {
   if (!modelGroup) return;
-  const cell = 256;
+  const cell = Math.min(EXPORT_RES[state.exportRes], 1024);
   const cols = 3;
   const rows = Math.ceil(ALL_MATERIALS.length / cols);
   const sheet = document.createElement('canvas');
@@ -734,29 +819,22 @@ function exportGrid() {
   sheet.height = rows * cell;
   const sctx = sheet.getContext('2d');
 
-  const prevRatio = renderer.getPixelRatio();
-  renderer.setPixelRatio(1);
-  renderer.setSize(cell, cell, false);
-  camera.aspect = 1;
-  camera.updateProjectionMatrix();
-
-  ALL_MATERIALS.forEach((name, idx) => {
-    assignMaterial(name);
-    root.rotation.set(-0.1, 0.65, 0);
-    root.position.set(0, 0, 0);
-    renderer.render(scene, camera);
-    const x = (idx % cols) * cell;
-    const y = Math.floor(idx / cols) * cell;
-    sctx.drawImage(renderer.domElement, x, y);
-    sctx.fillStyle = '#000';
-    sctx.font = '14px "IBM Plex Mono", monospace';
-    sctx.fillText(name, x + 10, y + cell - 12);
+  await withExportRenderer(cell, async (renderFrame) => {
+    const pose = () => root.rotation.set(-0.1, 0.65, 0);
+    for (const [idx, name] of ALL_MATERIALS.entries()) {
+      assignMaterial(name);
+      const frame = renderFrame(0, pose);
+      const x = (idx % cols) * cell;
+      const y = Math.floor(idx / cols) * cell;
+      sctx.drawImage(frame, x, y);
+      sctx.fillStyle = '#000';
+      sctx.font = `${Math.max(14, Math.round(cell * 0.05))}px "IBM Plex Mono", monospace`;
+      sctx.fillText(name, x + cell * 0.04, y + cell * 0.95);
+      await sleep(0);
+    }
+    assignMaterial(state.material);
+    sheet.toBlob((blob) => download(blob, `${state.svgName}-materials-${cell}px.png`), 'image/png');
   });
-
-  assignMaterial(state.material);
-  renderer.setPixelRatio(prevRatio);
-  resize();
-  sheet.toBlob((blob) => download(blob, `${state.svgName}-materials.png`), 'image/png');
 }
 
 function bindExport(id, fn) {
@@ -844,6 +922,17 @@ extraMaterialButton(
 const customSwatch = extraMaterialButton('custom', state.custom.color);
 
 buttonGroup(document.getElementById('envs'), ENVS, (n) => n === state.env, (n) => setEnv(n));
+
+buttonGroup(
+  document.getElementById('exportres'),
+  Object.keys(EXPORT_RES),
+  (n) => n === state.exportRes,
+  (n) => {
+    state.exportRes = n;
+    refreshActive('#exportres .btn', n);
+    updateURL();
+  }
+);
 
 for (const [group, names] of Object.entries(MOTIONS)) {
   buttonGroup(
@@ -1044,12 +1133,15 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 
-renderer.setAnimationLoop(() => {
-  const t = ((performance.now() / 1000) % LOOP_SECONDS) / LOOP_SECONDS;
-  applyMotion(t);
-  controls.update();
-  renderer.render(scene, camera);
-});
+function startMainLoop() {
+  renderer.setAnimationLoop(() => {
+    const t = ((performance.now() / 1000) % LOOP_SECONDS) / LOOP_SECONDS;
+    applyMotion(t);
+    controls.update();
+    renderer.render(scene, camera);
+  });
+}
+startMainLoop();
 
 setEnv(state.env);
 syncControls();
