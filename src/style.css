@@ -236,6 +236,44 @@ h2 {
   align-self: flex-start;
 }
 
+/* ----- highlighted call-to-action ----- */
+.btn.highlight {
+  --accent: #ff4d00;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--paper);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 7px 16px;
+  box-shadow: 0 0 0 0 rgba(255, 77, 0, 0.55);
+  animation: highlight-pulse 1.8s ease-out infinite;
+}
+
+.btn.highlight:hover {
+  background: #ff5e16;
+  border-color: #ff5e16;
+  animation-play-state: paused;
+  box-shadow: 0 0 0 4px rgba(255, 77, 0, 0.25);
+}
+
+@keyframes highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 0, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(255, 77, 0, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 0, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn.highlight {
+    animation: none;
+  }
+}
+
 #random {
   align-self: flex-start;
 }
